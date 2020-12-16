@@ -3,10 +3,18 @@
 use std::convert::TryInto;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
+#[cfg(feature = "aggregation")]
+use bitcoin::util::bip32::ChildNumber;
 use bitcoin::{BlockHeader, Script, Transaction, Txid};
 
 use batch::Batch;
+#[cfg(feature = "aggregation")]
+use miniscript::DescriptorPublicKey;
 use types::*;
+#[cfg(feature = "aggregation")]
+use util::Itertools;
+#[cfg(feature = "aggregation")]
+use Descriptor;
 
 /// API calls exposed by an Electrum client
 pub trait ElectrumApi {
@@ -63,6 +71,121 @@ pub trait ElectrumApi {
     fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, Error> {
         let buffer: Vec<u8> = serialize(tx);
         self.transaction_broadcast_raw(&buffer)
+    }
+
+    /// Returns all scripts derived from a descriptor that ever held any UTXOs. The function will
+    /// look `gap_limit` many scripts beyond the last used one.
+    #[cfg(feature = "aggregation")]
+    fn descriptor_used_scripts(
+        &self,
+        descriptor: &Descriptor,
+        gap_limit: usize,
+        chunk_size: usize,
+    ) -> Result<Vec<(ChildNumber, Script)>, Error> {
+        // Don't get stuck in an infinite loop if the descriptor only represents one script
+        if !descriptor_is_derivable(descriptor) {
+            let child_number = ChildNumber::Normal { index: 0 };
+            let ctx = miniscript::descriptor::DescriptorPublicKeyCtx::new(
+                &secp256k1::SECP256K1,
+                child_number,
+            );
+            let script = descriptor.script_pubkey(ctx);
+
+            if self.script_get_history(&script)?.is_empty() {
+                return Ok(vec![]);
+            } else {
+                return Ok(vec![(child_number, script)]);
+            }
+        }
+
+        let mut gap = 0;
+        let mut scripts = Vec::new();
+
+        let child_iter = (0..)
+            .map(|c| {
+                let child_number = ChildNumber::Normal { index: c };
+                let ctx = miniscript::descriptor::DescriptorPublicKeyCtx::new(
+                    &secp256k1::SECP256K1,
+                    child_number,
+                );
+                let script = descriptor.script_pubkey(ctx);
+                (child_number, script)
+            })
+            .chunk(chunk_size);
+
+        'outer: for children in child_iter {
+            let batch_response =
+                self.batch_script_get_history(children.iter().map(|(_, script)| script))?;
+
+            for (child, history) in children.into_iter().zip(batch_response.into_iter()) {
+                if history.is_empty() {
+                    gap += 1;
+                } else {
+                    scripts.push(child);
+                }
+
+                if gap >= gap_limit {
+                    break 'outer;
+                }
+            }
+        }
+
+        Ok(scripts)
+    }
+
+    /// Fetches the total balance of a descriptor containing extended public keys
+    ///
+    /// ```no_run
+    /// use electrum_client::{Client, Descriptor, ElectrumApi};
+    ///
+    /// let client = Client::new("ssl://some.electrum.server:50002", None).unwrap();
+    /// let desc: Descriptor = "sh(wpkh(xpub6DP...WB/0/*))".parse().unwrap();
+    /// println!("External chain balance (sats): {}", client.descriptor_balance(desc, 10, 10, false));
+    /// ```
+    #[cfg(feature = "aggregation")]
+    fn descriptor_balance(
+        &self,
+        descriptor: &Descriptor,
+        gap_limit: usize,
+        chunk_size: usize,
+        include_unconfirmed: bool,
+    ) -> Result<u64, Error> {
+        let scripts = self.descriptor_used_scripts(descriptor, gap_limit, chunk_size)?;
+        let balance = self
+            .batch_script_get_balance(scripts.iter().map(|s| &s.1))?
+            .iter()
+            .map(|balance| {
+                if include_unconfirmed {
+                    balance.confirmed + balance.unconfirmed
+                } else {
+                    balance.confirmed
+                }
+            })
+            .sum();
+
+        Ok(balance)
+    }
+
+    /// Fetches all UTXOs for a given descriptor.
+    #[cfg(feature = "aggregation")]
+    fn descriptor_utxos(
+        &self,
+        descriptor: &Descriptor,
+        gap_limit: usize,
+        chunk_size: usize,
+    ) -> Result<Vec<(ChildNumber, ListUnspentRes)>, Error> {
+        let scripts = self.descriptor_used_scripts(descriptor, gap_limit, chunk_size)?;
+        let batch_utxos = self.batch_script_list_unspent(scripts.iter().map(|s| &s.1))?;
+
+        // Flatten the returned result and attach the appropriate child numbers
+        let child_utxos = scripts
+            .iter()
+            .map(|s| s.0)
+            .zip(batch_utxos)
+            .flat_map(|(child, utxos)| utxos.into_iter().map(move |utxo| (child, utxo)))
+            .collect::<Vec<_>>();
+
+        Ok(child_utxos)
     }
 
     /// Execute a queue of calls stored in a [`Batch`](../batch/struct.Batch.html) struct. Returns
@@ -184,4 +307,32 @@ pub trait ElectrumApi {
     #[cfg(feature = "debug-calls")]
     /// Returns the number of network calls made since the creation of the client.
     fn calls_made(&self) -> usize;
+}
+
+#[cfg(feature = "aggregation")]
+pub fn descriptor_is_derivable(descriptor: &Descriptor) -> bool {
+    let mut contains_wildcard_pk = false;
+    let mut contains_wildcard_pkh = false;
+
+    fn is_wildcard(
+        pk: &DescriptorPublicKey,
+        out_var: &mut bool,
+    ) -> Result<DescriptorPublicKey, ()> {
+        match pk {
+            DescriptorPublicKey::XPub(ref xpub) => {
+                *out_var |= xpub.is_wildcard;
+            }
+            DescriptorPublicKey::SinglePub(_) => {}
+        }
+        Ok(pk.clone())
+    }
+
+    descriptor
+        .translate_pk(
+            |pk| is_wildcard(pk, &mut contains_wildcard_pk),
+            |pk| is_wildcard(pk, &mut contains_wildcard_pkh),
+        )
+        .expect("Translation can't fail.");
+
+    contains_wildcard_pk | contains_wildcard_pkh
 }
